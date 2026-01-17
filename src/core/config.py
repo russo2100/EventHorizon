@@ -1,23 +1,15 @@
-import os
-from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
+from typing import Optional  # ← ДОБАВИЛИ ЭТУ СТРОКУ
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "EventHorizon"
-    VERSION: str = "0.1.0"
+    INDEX_PATH: str = "data/txtai_index"
+    OPENROUTER_API_KEY: Optional[str] = None  # Теперь Optional определен
+    LLM_MODEL: str = "tngtech/deepseek-r1t2-chimera:free"  # Обновили модель
     
-    # ВАЖНО: Мы задаем путь ОТНОСИТЕЛЬНО текущей рабочей директории.
-    # Это позволяет избежать передачи полного пути с кириллицей в C++ библиотеки.
-    # Точка (.) означает "текущая папка запуска".
-    INDEX_PATH_STR: str = "data/index"
-    
-    model_config = SettingsConfigDict(
-        env_file=".env", 
-        env_file_encoding="utf-8",
-        extra="ignore"
-    )
+    model_config = {
+        "env_file": ".env",
+         "case_sensitive": True
+     }
 
 settings = Settings()
-
-# Создаем папку (Python умеет работать с кириллицей, он создаст)
-os.makedirs(settings.INDEX_PATH_STR, exist_ok=True)

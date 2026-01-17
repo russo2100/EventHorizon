@@ -1,82 +1,167 @@
-# src/services/knowledge_engine.py
-import uuid
 import os
-from txtai.embeddings import Embeddings
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 from loguru import logger
+
 from src.core.config import settings
-from src.domain.models import Event, EventCreate
+from src.domain.models import SearchResult
+
+try:
+    # txtai опционален: если его нет, сервис должен стартовать без падения
+    from txtai import Embeddings  # type: ignore
+except ModuleNotFoundError:
+    Embeddings = None  # type: ignore
+
 
 class KnowledgeEngine:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        self.embeddings = Embeddings({
-            "path": "sentence-transformers/all-MiniLM-L6-v2",
-            "content": True,
-            "autodbm": True
-        })
-        self._load_or_create()
+        if getattr(self, "_initialized", False):
+            return
 
-    def _load_or_create(self):
-        # Проверяем наличие файла внутри относительной папки
-        if os.path.exists(f"{settings.INDEX_PATH_STR}/embeddings"):
+        self.index_path: str = settings.INDEX_PATH
+        self.embeddings = self._create_embeddings()
+        self.documents: List[Dict[str, Any]] = []
+
+        self._load_index()
+        self._initialized = True
+
+    def _create_embeddings(self):
+        if Embeddings is None:
+            logger.warning("txtai is not installed: KnowledgeEngine работает в режиме заглушки (без поиска).")
+            return None
+        try:
+            return Embeddings()
+        except Exception as e:
+            logger.exception(f"Не удалось создать Embeddings(): {e}")
+            return None
+
+    def _ensure_enabled(self) -> bool:
+        if self.embeddings is None:
+            return False
+        return True
+
+    def _load_index(self) -> None:
+        """Загрузка существующего индекса, если он есть на диске."""
+        if not self._ensure_enabled():
+            return
+
+        if os.path.exists(self.index_path):
             try:
-                self.embeddings.load(settings.INDEX_PATH_STR)
-                logger.info(f"Индекс загружен из: {settings.INDEX_PATH_STR}")
+                self.embeddings.load(self.index_path)
+                logger.info(f"Индекс загружен из {self.index_path}")
             except Exception as e:
-                logger.error(f"Ошибка загрузки (возможно поврежден): {e}")
-        else:
-            logger.info("Индекс будет создан с нуля.")
+                logger.warning(f"Не удалось загрузить индекс: {e}")
+                # пересоздаём embeddings, чтобы не жить в поломанном состоянии
+                self.embeddings = self._create_embeddings()
 
-    def add_event(self, event_in: EventCreate) -> Event:
-        event_id = str(uuid.uuid4())
-        event = Event(id=event_id, **event_in.model_dump())
-        
-        # Добавляем в память
-        self.embeddings.upsert([(event_id, event.content, None)])
-        
-        # Сохраняем по ОТНОСИТЕЛЬНОМУ пути
+    def add_event(self, content: str, metadata: Dict[str, Any]) -> int:
+        """Добавление события в индекс (и in-memory список документов)."""
+        event_id = len(self.documents)
+
+        self.documents.append(
+            {
+                "id": event_id,
+                "text": content,
+                "metadata": metadata,
+            }
+        )
+
+        # Если txtai отключён — просто возвращаем id, без индексации
+        if not self._ensure_enabled():
+            logger.warning("add_event: txtai недоступен, событие сохранено только в памяти (без индекса).")
+            return event_id
+
         try:
-            self.embeddings.save(settings.INDEX_PATH_STR)
-            logger.success(f"Событие {event_id} сохранено.")
+            # txtai индексирует список (id, text, tags/metadata/None)
+            self.embeddings.index([(doc["id"], doc["text"], None) for doc in self.documents])
+
+            # Сохранение на диск
+            os.makedirs(os.path.dirname(self.index_path) or ".", exist_ok=True)
+            self.embeddings.save(self.index_path)
         except Exception as e:
-            logger.error(f"Ошибка FAISS при записи в '{settings.INDEX_PATH_STR}': {e}")
-            # Дополнительный лог для понимания, где мы находимся
-            logger.error(f"Текущая директория: {os.getcwd()}")
-            raise e
-            
-        return event
-    
-    def search(self, query: str, limit: int = 3):
-        try:
-            logger.info(f"Выполняется поиск по запросу: {query}")
-            
-            # Выполняем поиск
-            # txtai возвращает список словарей, если content=True, 
-            # или список кортежей (id, score), если нет.
-            raw_results = self.embeddings.search(query, limit)
-            
-            normalized_results = []
-            for res in raw_results:
-                # Нормализуем результат к единому виду
-                if isinstance(res, dict):
-                    normalized_results.append({
-                        "id": res.get("id"),
-                        "text": res.get("text"),
-                        "score": round(float(res.get("score", 0)), 4)
-                    })
-                elif isinstance(res, tuple):
-                    normalized_results.append({
-                        "id": res[0],
-                        "score": round(float(res[1]), 4)
-                    })
-            
-            logger.info(f"Найдено результатов: {len(normalized_results)}")
-            return normalized_results
-            
-        except Exception as e:
-            logger.error(f"Ошибка при выполнении поиска: {e}")
-            # Возвращаем пустой список, чтобы API не падало с 500 ошибкой
+            logger.exception(f"Ошибка индексации/сохранения: {e}")
+
+        return event_id
+
+    def search(self, query: str, limit: int = 5) -> List[SearchResult]:
+        """Семантический поиск по документам."""
+        if not self.documents:
+            logger.warning("База событий пуста")
             return []
 
+        if not self._ensure_enabled():
+            logger.warning("search: txtai недоступен, возвращаю пустой список.")
+            return []
+
+        try:
+            results = self.embeddings.search(query, limit)
+        except Exception as e:
+            logger.exception(f"Ошибка поиска: {e}")
+            return []
+
+        if not results:
+            return []
+
+        search_results: List[SearchResult] = []
+
+        for doc_id, score in self._normalize_results(results):
+            doc = next((d for d in self.documents if d["id"] == doc_id), None)
+            if not doc:
+                continue
+
+            search_results.append(
+                SearchResult(
+                    id=doc_id,
+                    text=doc["text"],
+                    score=float(score),
+                )
+            )
+
+        return search_results
+
+    def _normalize_results(
+        self, results: Any
+    ) -> List[Tuple[int, float]]:
+        """
+        txtai может вернуть:
+        - list[tuple(id, score)]
+        - list[dict] с ключами id/score
+        Нормализуем к list[(id:int, score:float)].
+        """
+        normalized: List[Tuple[int, float]] = []
+
+        if not isinstance(results, list):
+            return normalized
+
+        for item in results:
+            doc_id: Optional[int] = None
+            score: float = 0.0
+
+            if isinstance(item, tuple) and len(item) >= 2:
+                doc_id = int(item[0])
+                score = float(item[1])
+            elif isinstance(item, dict):
+                if "id" in item:
+                    doc_id = int(item.get("id"))
+                score = float(item.get("score", 0.0))
+            else:
+                continue
+
+            if doc_id is None:
+                continue
+
+            normalized.append((doc_id, score))
+
+        return normalized
 
 
-engine = KnowledgeEngine()
+# Singleton instance (как у тебя было)
+knowledge_engine = KnowledgeEngine()
